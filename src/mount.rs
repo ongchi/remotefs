@@ -225,6 +225,7 @@ pub fn mount_and_run(
         std::mem::forget(_session);
     } else {
         eprintln!("Signal received, unmounting {}…", mount_point.display());
+        drop(_session); // unmount before touching the mount-point directory
     }
 
     if created_mount_point {
