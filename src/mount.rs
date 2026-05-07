@@ -3,6 +3,7 @@
 use crate::RemoteFs;
 use anyhow::Result;
 use fuser::{Config, MountOption, SessionACL};
+use std::cell::Cell;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,35 +20,63 @@ extern "C" fn handle_signal(_: libc::c_int) {
 
 /// Passed to `mount_and_run`. The child calls `notify()` once the FUSE session
 /// is live; the waiting parent then exits, returning the shell prompt.
+///
+/// Uses `Cell` for interior mutability so `notify`/`fail` can be called via
+/// `&self` references (e.g. inside `map_err` closures).
 pub struct ReadyNotifier {
-    fd: Option<RawFd>,
+    fd: Cell<Option<RawFd>>,
 }
 
 impl ReadyNotifier {
     fn noop() -> Self {
-        Self { fd: None }
+        Self {
+            fd: Cell::new(None),
+        }
     }
 
     pub fn is_daemon(&self) -> bool {
-        self.fd.is_some()
+        self.fd.get().is_some()
     }
 
-    /// Write the "ready" byte to the parent and redirect stdio to `/dev/null`.
-    pub fn notify(self) {
-        let Some(fd) = self.fd else { return };
+    /// Signal success to the parent and redirect stdio to `/dev/null`.
+    pub fn notify(&self) {
+        let Some(fd) = self.fd.take() else { return };
         unsafe {
+            // Byte 0 = success.
             let ok: u8 = 0;
             libc::write(fd, &ok as *const u8 as *const libc::c_void, 1);
             libc::close(fd);
-            // Redirect stdio so the daemon doesn't produce unexpected output.
-            let devnull =
-                libc::open(c"/dev/null".as_ptr() as *const libc::c_char, libc::O_RDWR);
+            let devnull = libc::open(c"/dev/null".as_ptr() as *const libc::c_char, libc::O_RDWR);
             if devnull >= 0 {
                 libc::dup2(devnull, 0);
                 libc::dup2(devnull, 1);
                 libc::dup2(devnull, 2);
                 libc::close(devnull);
             }
+        }
+    }
+
+    /// Signal failure to the parent with a human-readable message.
+    pub fn fail(&self, msg: &str) {
+        let Some(fd) = self.fd.take() else { return };
+        // Write header + message as a single syscall so the parent always reads
+        // the complete payload in one read() call (POSIX atomic for < PIPE_BUF).
+        let mut buf = Vec::with_capacity(1 + msg.len());
+        buf.push(1u8); // Byte 1 = error
+        buf.extend_from_slice(msg.as_bytes());
+        unsafe {
+            libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len());
+            libc::close(fd);
+        }
+    }
+}
+
+impl Drop for ReadyNotifier {
+    fn drop(&mut self) {
+        // fd still open means neither notify() nor fail() was called.
+        // Close it so the parent's read() returns EOF instead of hanging.
+        if let Some(fd) = self.fd.take() {
+            unsafe { libc::close(fd) };
         }
     }
 }
@@ -80,21 +109,37 @@ pub fn daemonize_if(enabled: bool) -> Result<ReadyNotifier> {
             // Child: close read end, become session leader, continue.
             unsafe { libc::close(read_fd) };
             unsafe { libc::setsid() };
-            Ok(ReadyNotifier { fd: Some(write_fd) })
+            Ok(ReadyNotifier {
+                fd: Cell::new(Some(write_fd)),
+            })
         }
         _ => {
             // Parent: wait for child to signal success, then exit.
             unsafe { libc::close(write_fd) };
-            let mut byte: u8 = 1;
-            let n = unsafe {
-                libc::read(read_fd, &mut byte as *mut u8 as *mut libc::c_void, 1)
-            };
+            let mut buf = [0u8; 1025];
+            let n =
+                unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             unsafe { libc::close(read_fd) };
-            if n == 1 && byte == 0 {
-                std::process::exit(0);
-            } else {
-                eprintln!("Daemon failed to mount.");
-                std::process::exit(1);
+            match (n, buf.first()) {
+                (1.., Some(&0)) => std::process::exit(0),
+                (1.., Some(&1)) => {
+                    let msg = if n > 1 {
+                        std::str::from_utf8(&buf[1..n as usize]).unwrap_or("(non-UTF-8)")
+                    } else {
+                        "(no details)"
+                    };
+                    eprintln!("Daemon failed to mount: {msg}");
+                    eprintln!("Tip: run with -f/--foreground to see the full error output.");
+                    std::process::exit(1);
+                }
+                _ => {
+                    eprintln!(
+                        "Daemon failed to mount (child exited without signalling).\n\
+                         Tip: run with -f/--foreground to see full output.\n\
+                         If the mount point is busy, run: umount <mountpoint>"
+                    );
+                    std::process::exit(1);
+                }
             }
         }
     }
@@ -109,7 +154,7 @@ pub fn mount_and_run(
     mount_point: &std::path::Path,
     fs_name: &str,
     created_mount_point: bool,
-    ready: ReadyNotifier,
+    ready: &ReadyNotifier,
 ) -> Result<()> {
     let vol_name = mount_point
         .file_name()
@@ -150,14 +195,21 @@ pub fn mount_and_run(
 
     let unmounted = fs.unmounted_flag();
     let notifier_handle = fs.notifier_handle();
-    let _session = fuser::spawn_mount2(fs, mount_point, &config)?;
-    // Install the notifier so background readdir fetches can push
-    // inval_inode messages to the kernel.
+    let _session = match fuser::spawn_mount2(fs, mount_point, &config) {
+        Ok(s) => s,
+        Err(e) => {
+            let hint = if e.raw_os_error() == Some(libc::EBUSY) {
+                format!("{e} — try: umount {}", mount_point.display())
+            } else {
+                e.to_string()
+            };
+            ready.fail(&hint);
+            return Err(e.into());
+        }
+    };
     *notifier_handle.lock().unwrap() = Some(_session.notifier());
 
     let is_daemon = ready.is_daemon();
-    // Signal the parent that the mount is live (no-op when not daemonizing).
-    // Also redirects stdio to /dev/null in daemon mode.
     ready.notify();
 
     if !is_daemon {

@@ -47,8 +47,7 @@ pub trait RemoteBackend: Send + Sync + 'static {
     /// - **SFTP**: seeks to `offset` and writes `data` in-place (fast path).
     /// - **Drive**: reads `local_cache` and uploads the whole file (Drive has
     ///   no partial-update API).
-    fn async_write(&self, path: &str, offset: u64, data: &[u8], local_cache: &Path)
-        -> Result<()>;
+    fn async_write(&self, path: &str, offset: u64, data: &[u8], local_cache: &Path) -> Result<()>;
 
     fn create_file(&self, path: &str, mode: u32) -> Result<()>;
     fn create_dir(&self, path: &str, mode: u32) -> Result<()>;

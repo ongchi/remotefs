@@ -15,7 +15,6 @@
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write as _};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -67,10 +66,7 @@ pub fn is_service_account(text: &str) -> bool {
 /// Obtain a short-lived access token for a service account via JWT assertion.
 ///
 /// No token file is written — call this again when the token expires.
-pub fn obtain_service_account_token(
-    key: &ServiceAccountKey,
-    http: &reqwest::blocking::Client,
-) -> Result<Token> {
+pub fn obtain_service_account_token(key: &ServiceAccountKey, http: &ureq::Agent) -> Result<Token> {
     let jwt = make_service_account_jwt(key)?;
     let params = [
         ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
@@ -78,12 +74,9 @@ pub fn obtain_service_account_token(
     ];
     let resp: TokenResponse = http
         .post(&key.token_uri)
-        .form(&params)
-        .send()
-        .context("service account token request")?
-        .error_for_status()
-        .context("service account token response")?
-        .json()
+        .send_form(&params)
+        .map_err(|e| anyhow!("service account token request: {e}"))?
+        .into_json()
         .context("parse service account token response")?;
     Ok(Token {
         access_token: resp.access_token,
@@ -148,7 +141,7 @@ impl Token {
     }
 
     /// Exchange the refresh token for a new access token in-place.
-    pub fn refresh(&mut self, http: &reqwest::blocking::Client) -> Result<()> {
+    pub fn refresh(&mut self, http: &ureq::Agent) -> Result<()> {
         let refresh_token = self
             .refresh_token
             .clone()
@@ -163,12 +156,9 @@ impl Token {
 
         let resp: TokenResponse = http
             .post(&self.token_uri)
-            .form(&params)
-            .send()
-            .context("token refresh request")?
-            .error_for_status()
-            .context("token refresh response")?
-            .json()
+            .send_form(&params)
+            .map_err(|e| anyhow!("token refresh request: {e}"))?
+            .into_json()
             .context("parse token refresh")?;
 
         self.access_token = resp.access_token;
@@ -192,21 +182,27 @@ struct TokenResponse {
 // ---------------------------------------------------------------------------
 
 /// Load a cached token or run the full browser-based authorization flow.
-pub fn load_or_authorize(
-    client: &OAuthClient,
-    http: &reqwest::blocking::Client,
-    email: &str,
-) -> Result<Token> {
+pub fn load_or_authorize(client: &OAuthClient, http: &ureq::Agent, email: &str) -> Result<Token> {
     let path = token_path(email);
 
     if path.exists() {
         if let Ok(text) = std::fs::read_to_string(&path) {
             if let Ok(mut token) = serde_json::from_str::<Token>(&text) {
                 if token.is_expired() {
-                    token.refresh(http).context("refresh stored token")?;
-                    save_token(&token)?;
+                    match token.refresh(http) {
+                        Ok(()) => {
+                            save_token(&token)?;
+                            return Ok(token);
+                        }
+                        Err(e) => {
+                            // Refresh token revoked or rejected — fall through to
+                            // re-authorize via browser.
+                            eprintln!("Stored token refresh failed ({e:#}); re-authorizing…");
+                        }
+                    }
+                } else {
+                    return Ok(token);
                 }
-                return Ok(token);
             }
         }
     }
@@ -220,7 +216,7 @@ pub fn load_or_authorize(
 // Browser OAuth2 flow
 // ---------------------------------------------------------------------------
 
-fn run_browser_flow(client: &OAuthClient, http: &reqwest::blocking::Client) -> Result<Token> {
+fn run_browser_flow(client: &OAuthClient, http: &ureq::Agent) -> Result<Token> {
     let listener = TcpListener::bind("127.0.0.1:0").context("bind local OAuth2 redirect server")?;
     let port = listener.local_addr()?.port();
     let redirect_uri = format!("http://localhost:{port}");
@@ -243,7 +239,7 @@ fn run_browser_flow(client: &OAuthClient, http: &reqwest::blocking::Client) -> R
 }
 
 fn build_auth_url(auth_uri: &str, client_id: &str, redirect_uri: &str) -> Result<String> {
-    let mut url = reqwest::Url::parse(auth_uri).context("parse auth_uri")?;
+    let mut url = url::Url::parse(auth_uri).context("parse auth_uri")?;
     url.query_pairs_mut()
         .append_pair("client_id", client_id)
         .append_pair("redirect_uri", redirect_uri)
@@ -264,7 +260,12 @@ fn extract_code(stream: &std::net::TcpStream) -> Result<String> {
         .nth(1)
         .ok_or_else(|| anyhow!("malformed HTTP request line: {first_line:?}"))?;
 
-    for param in path.split_once('?').map(|(_, q)| q).unwrap_or("").split('&') {
+    for param in path
+        .split_once('?')
+        .map(|(_, q)| q)
+        .unwrap_or("")
+        .split('&')
+    {
         if let Some(code) = param.strip_prefix("code=") {
             return Ok(code.to_string());
         }
@@ -278,27 +279,21 @@ fn extract_code(stream: &std::net::TcpStream) -> Result<String> {
 
 fn exchange_code(
     client: &OAuthClient,
-    http: &reqwest::blocking::Client,
+    http: &ureq::Agent,
     code: &str,
     redirect_uri: &str,
 ) -> Result<Token> {
-    let params: HashMap<&str, &str> = [
-        ("code", code),
-        ("client_id", client.client_id.as_str()),
-        ("client_secret", client.client_secret.as_str()),
-        ("redirect_uri", redirect_uri),
-        ("grant_type", "authorization_code"),
-    ]
-    .into();
-
     let resp: TokenResponse = http
         .post(&client.token_uri)
-        .form(&params)
-        .send()
-        .context("exchange code request")?
-        .error_for_status()
-        .context("exchange code response")?
-        .json()
+        .send_form(&[
+            ("code", code),
+            ("client_id", client.client_id.as_str()),
+            ("client_secret", client.client_secret.as_str()),
+            ("redirect_uri", redirect_uri),
+            ("grant_type", "authorization_code"),
+        ])
+        .map_err(|e| anyhow!("exchange code request: {e}"))?
+        .into_json()
         .context("parse code exchange")?;
 
     Ok(Token {

@@ -69,9 +69,9 @@ impl RemoteBackend for SftpBackend {
         let tmp = PathBuf::from(format!("{}.tmp", dest.display()));
 
         let result: Result<()> = (|| {
-            let mut remote = conn
-                .sftp()
-                .open_mode(Path::new(path), ssh2::OpenFlags::READ, 0, OpenType::File)?;
+            let mut remote =
+                conn.sftp()
+                    .open_mode(Path::new(path), ssh2::OpenFlags::READ, 0, OpenType::File)?;
             let mut local = std::fs::File::create(&tmp)?;
             std::io::copy(&mut remote, &mut local)?;
             std::fs::rename(&tmp, dest)?;
@@ -115,8 +115,7 @@ impl RemoteBackend for SftpBackend {
             .with_context(|| format!("open {path} for async write"))?;
         f.seek(SeekFrom::Start(offset))
             .with_context(|| format!("seek {path}"))?;
-        f.write_all(data)
-            .with_context(|| format!("write {path}"))?;
+        f.write_all(data).with_context(|| format!("write {path}"))?;
         Ok(())
     }
 
@@ -192,8 +191,7 @@ impl RemoteBackend for SftpBackend {
     }
 
     fn new_worker(&self) -> Result<Arc<dyn RemoteBackend>> {
-        let conn = SftpConn::connect(&self.config)
-            .context("open worker SFTP connection")?;
+        let conn = SftpConn::connect(&self.config).context("open worker SFTP connection")?;
         Ok(SftpBackend::new(conn, self.config.clone()))
     }
 }

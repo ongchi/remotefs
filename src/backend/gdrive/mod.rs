@@ -31,6 +31,13 @@ mod client;
 
 pub use auth::{CredentialsFile, OAuthClient};
 
+/// Authentication result from the pre-fork phase. Carries only pure data
+/// (no background threads), so it is safe to pass across `fork()`.
+pub enum PreAuth {
+    OAuth2(auth::Token),
+    ServiceAccount(auth::ServiceAccountKey),
+}
+
 use super::{AttrChange, RemoteBackend};
 use crate::stat::StatData;
 use anyhow::{Context, Result, anyhow};
@@ -125,80 +132,85 @@ pub struct DriveBackend {
 }
 
 impl DriveBackend {
-    /// Connect to Google Drive.
+    /// Phase 1: authenticate only — may open a browser, but creates no
+    /// persistent HTTP client. Returns pure data (no background threads),
+    /// so it is safe to call before `fork()`.
+    pub fn authenticate(creds_path: &Path, email: &str) -> Result<PreAuth> {
+        let text = std::fs::read_to_string(creds_path)
+            .with_context(|| format!("read credentials {}", creds_path.display()))?;
+
+        if auth::is_service_account(&text) {
+            let key: auth::ServiceAccountKey =
+                serde_json::from_str(&text).context("parse service account key")?;
+            Ok(PreAuth::ServiceAccount(key))
+        } else {
+            let creds: auth::CredentialsFile =
+                serde_json::from_str(&text).context("parse credentials.json")?;
+            // Temporary HTTP client — dropped before fork so its tokio runtime
+            // is shut down and won't be inherited in a dead state by the child.
+            let http = build_http_client();
+            let token = auth::load_or_authorize(&creds.installed, &http, email)
+                .context("Google Drive authorization")?;
+            Ok(PreAuth::OAuth2(token))
+        }
+    }
+
+    /// Phase 2: connect with a fresh HTTP client.
     ///
-    /// Auto-detects credential type from the file contents:
-    /// - If the file has `"type": "service_account"`, uses the JWT service
-    ///   account flow — no browser window, no token file written.
-    /// - Otherwise, uses the OAuth2 installed-app flow with token persistence.
-    ///
-    /// If `shared_drive_id` is `Some`, the mount root is set to that Shared
-    /// Drive rather than My Drive. All API calls include the parameters
-    /// required for Shared Drive access.
+    /// Creates a new `reqwest::blocking::Client` (and its tokio runtime) in
+    /// the calling process. Always call this **after** `fork()` so the new
+    /// runtime is not a dead copy of the parent's.
+    pub fn connect_from_auth(
+        pre_auth: PreAuth,
+        email: &str,
+        shared_drive_id: Option<&str>,
+    ) -> Result<Arc<Self>> {
+        match pre_auth {
+            PreAuth::OAuth2(token) => {
+                let http = build_http_client();
+                let drive_http = DriveHttp::new(http, token, shared_drive_id.map(str::to_string));
+
+                let actual_email = drive_http
+                    .account_email()
+                    .context("resolve account email")?;
+                eprintln!("Authenticated as {actual_email}");
+
+                if actual_email != email {
+                    let safe = email.replace(['@', '.'], "_");
+                    anyhow::bail!(
+                        "expected account {email} but authenticated as {actual_email}\n\
+                         Delete ~/.config/remotefs/gdrive_token_{safe}.json to re-authorize"
+                    );
+                }
+
+                drive_http.set_email(&actual_email);
+                Self::finish_connect(drive_http)
+            }
+            PreAuth::ServiceAccount(key) => {
+                let http = build_http_client();
+                let token = auth::obtain_service_account_token(&key, &http)
+                    .context("obtain service account token")?;
+                eprintln!("Authenticated as {} (service account)", key.client_email);
+                let drive_http = DriveHttp::new_service_account(
+                    http,
+                    token,
+                    key,
+                    shared_drive_id.map(str::to_string),
+                );
+                Self::finish_connect(drive_http)
+            }
+        }
+    }
+
+    /// Convenience wrapper — authenticate then connect in one call.
+    /// Use only when not daemonizing (foreground mode).
     pub fn connect(
         creds_path: &Path,
         email: &str,
         shared_drive_id: Option<&str>,
     ) -> Result<Arc<Self>> {
-        let text = std::fs::read_to_string(creds_path)
-            .with_context(|| format!("read credentials {}", creds_path.display()))?;
-
-        if auth::is_service_account(&text) {
-            Self::connect_service_account(&text, shared_drive_id)
-        } else {
-            Self::connect_oauth2(&text, email, shared_drive_id)
-        }
-    }
-
-    fn connect_oauth2(
-        text: &str,
-        email: &str,
-        shared_drive_id: Option<&str>,
-    ) -> Result<Arc<Self>> {
-        let creds: auth::CredentialsFile =
-            serde_json::from_str(text).context("parse credentials.json")?;
-        let client_info = creds.installed;
-
-        let http = build_http_client()?;
-        let token = auth::load_or_authorize(&client_info, &http, email)
-            .context("Google Drive authorization")?;
-
-        let drive_http = DriveHttp::new(http, token, shared_drive_id.map(str::to_string));
-
-        let actual_email = drive_http
-            .account_email()
-            .context("resolve account email")?;
-        eprintln!("Authenticated as {actual_email}");
-
-        if actual_email != email {
-            let safe = email.replace(['@', '.'], "_");
-            anyhow::bail!(
-                "expected account {email} but authenticated as {actual_email}\n\
-                 Delete ~/.config/remotefs/gdrive_token_{safe}.json to re-authorize"
-            );
-        }
-
-        drive_http.set_email(&actual_email);
-        Self::finish_connect(drive_http)
-    }
-
-    fn connect_service_account(text: &str, shared_drive_id: Option<&str>) -> Result<Arc<Self>> {
-        let key: auth::ServiceAccountKey =
-            serde_json::from_str(text).context("parse service account key")?;
-
-        let http = build_http_client()?;
-        let token = auth::obtain_service_account_token(&key, &http)
-            .context("obtain service account token")?;
-
-        eprintln!("Authenticated as {} (service account)", key.client_email);
-
-        let drive_http = DriveHttp::new_service_account(
-            http,
-            token,
-            key,
-            shared_drive_id.map(str::to_string),
-        );
-        Self::finish_connect(drive_http)
+        let pre_auth = Self::authenticate(creds_path, email)?;
+        Self::connect_from_auth(pre_auth, email, shared_drive_id)
     }
 
     fn finish_connect(drive_http: DriveHttp) -> Result<Arc<Self>> {
@@ -456,8 +468,8 @@ impl RemoteBackend for DriveBackend {
         let id = self
             .resolve_id(path)?
             .ok_or_else(|| anyhow!("async_write: {path} not found"))?;
-        let content = std::fs::read(local_cache)
-            .with_context(|| format!("read local cache for {path}"))?;
+        let content =
+            std::fs::read(local_cache).with_context(|| format!("read local cache for {path}"))?;
         self.inner.http.upload(&id, content)?;
         Ok(())
     }
@@ -521,7 +533,9 @@ impl RemoteBackend for DriveBackend {
                 .resolve_id(old)?
                 .ok_or_else(|| anyhow!("rename: {old} not found in trash"))?;
             let (new_parent_id, new_name) = self.resolve_parent(new)?;
-            self.inner.http.restore_file(&id, &new_parent_id, &new_name)?;
+            self.inner
+                .http
+                .restore_file(&id, &new_parent_id, &new_name)?;
             let mut cache = self.inner.paths.lock().unwrap();
             cache.remove_prefix(old);
             cache.insert(new.to_string(), id);
@@ -646,11 +660,10 @@ fn is_in_trash(path: &str) -> bool {
 // Module-level helpers
 // ---------------------------------------------------------------------------
 
-fn build_http_client() -> Result<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
+fn build_http_client() -> ureq::Agent {
+    ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(120))
         .build()
-        .context("build HTTP client")
 }
 
 fn resolve_root_id(drive_http: &DriveHttp) -> Result<String> {
@@ -659,7 +672,9 @@ fn resolve_root_id(drive_http: &DriveHttp) -> Result<String> {
         log::info!("Using Shared Drive ID = {drive_id} as mount root");
         Ok(drive_id.to_string())
     } else {
-        let root = drive_http.get_file("root").context("resolve My Drive root")?;
+        let root = drive_http
+            .get_file("root")
+            .context("resolve My Drive root")?;
         Ok(root.id)
     }
 }

@@ -28,9 +28,9 @@
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
+use remotefs::RemoteFs;
 use remotefs::backend::gdrive::DriveBackend;
 use remotefs::mount::{absolute_path, daemonize_if, mount_and_run};
-use remotefs::RemoteFs;
 use remotefs::shared::Shared;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -139,14 +139,30 @@ fn main() -> Result<()> {
             .with_context(|| format!("create mount point {}", mount_point.display()))?;
     }
 
+    // Phase 1: browser auth or token refresh (may open a browser window).
+    // Runs in the parent before fork; the temporary HTTP client is dropped
+    // here so its tokio reactor thread is stopped before fork().
     eprintln!("Connecting to Google Drive as {email}…");
-    let backend = DriveBackend::connect(&creds_path, &email, args.shared_drive.as_deref())?;
+    let pre_auth = DriveBackend::authenticate(&creds_path, &email)?;
 
-    let shared = Arc::new(Shared::new(
-        Arc::clone(&backend) as _,
-        cache_path,
-        args.cache_size_mb,
-    )?);
+    // Fork before creating any HTTP client or thread pool, so the child
+    // starts with no inherited tokio reactor threads.
+    let ready = daemonize_if(!args.foreground)?;
+
+    // Phase 2: create a fresh HTTP client in the child and complete the
+    // connection (account verification + root folder resolution).
+    let backend = DriveBackend::connect_from_auth(pre_auth, &email, args.shared_drive.as_deref())
+        .map_err(|e| {
+        ready.fail(&format!("{e:#}"));
+        e
+    })?;
+
+    let shared = Arc::new(
+        Shared::new(Arc::clone(&backend) as _, cache_path, args.cache_size_mb).map_err(|e| {
+            ready.fail(&format!("{e:#}"));
+            e
+        })?,
+    );
 
     let parallel = args.parallel.unwrap_or_else(|| {
         std::thread::available_parallelism()
@@ -155,15 +171,15 @@ fn main() -> Result<()> {
             * 4
     });
 
-    // Fork before creating thread pools so the fork happens while
-    // the process is single-threaded.
-    let ready = daemonize_if(!args.foreground)?;
-
     let task_pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(parallel)
             .thread_name(|i| format!("gdrive-pool-{i}"))
-            .build()?,
+            .build()
+            .map_err(|e| {
+                ready.fail(&format!("{e:#}"));
+                e
+            })?,
     );
 
     let mut fs = RemoteFs::new(drive_path, backend as _, Arc::clone(&shared), task_pool);
@@ -172,7 +188,7 @@ fn main() -> Result<()> {
         fs.start_cache_updater(args.cache_timeout);
     }
 
-    mount_and_run(fs, &mount_point, "gdrive", created_mount_point, ready)
+    mount_and_run(fs, &mount_point, "gdrive", created_mount_point, &ready)
 }
 
 // ---------------------------------------------------------------------------

@@ -24,8 +24,8 @@
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use remotefs::RemoteFs;
-use remotefs::mount::{absolute_path, daemonize_if, mount_and_run};
 use remotefs::backend::sftp::{SftpBackend, SftpConn, SshConfig};
+use remotefs::mount::{absolute_path, daemonize_if, mount_and_run};
 use remotefs::shared::Shared;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -171,7 +171,7 @@ fn main() -> Result<()> {
         fs.start_cache_updater(args.cache_timeout);
     }
 
-    mount_and_run(fs, &mount_point, "sftp", created_mount_point, ready)
+    mount_and_run(fs, &mount_point, "sftp", created_mount_point, &ready)
 }
 
 // ---------------------------------------------------------------------------
@@ -232,9 +232,7 @@ impl SshHostParams {
                 "hostname" => params.hostname = Some(value.to_string()),
                 "port" => params.port = value.parse().ok(),
                 "user" => params.user = Some(value.to_string()),
-                "identityfile"
-                    if params.identity_file.is_none() =>
-                {
+                "identityfile" if params.identity_file.is_none() => {
                     let p = expand_tilde(value);
                     if p.exists() {
                         params.identity_file = Some(p);

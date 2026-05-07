@@ -11,12 +11,13 @@
 //!
 //! ## Service Account refresh
 //!
-//! When `sa_key` is `Some`, an expired token is renewed by signing a fresh JWT
+//! When `sa_key` is `Some`, an expired token is renewed by re-signing a fresh JWT
 //! assertion instead of using a refresh token.
 
 use super::auth::{ServiceAccountKey, Token};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
+use std::io::Read;
 use std::sync::Mutex;
 
 const API_BASE: &str = "https://www.googleapis.com/drive/v3";
@@ -67,10 +68,12 @@ impl DriveFile {
 // Drive HTTP client
 // ---------------------------------------------------------------------------
 
-/// Thread-safe wrapper around a `reqwest` blocking client, an OAuth2 / service
-/// account token, and optional Shared Drive context.
+/// Thread-safe wrapper around a `ureq` agent, an OAuth2 / service account
+/// token, and optional Shared Drive context.
+///
+/// Uses `ureq` (no background threads) so it is safe to create after `fork()`.
 pub struct DriveHttp {
-    http: reqwest::blocking::Client,
+    http: ureq::Agent,
     token: Mutex<Token>,
     /// When `Some`, expired tokens are renewed by re-signing a JWT assertion
     /// instead of exchanging a refresh token.
@@ -82,11 +85,7 @@ pub struct DriveHttp {
 
 impl DriveHttp {
     /// Construct a client for the OAuth2 (installed-app) flow.
-    pub fn new(
-        http: reqwest::blocking::Client,
-        token: Token,
-        shared_drive_id: Option<String>,
-    ) -> Self {
+    pub fn new(http: ureq::Agent, token: Token, shared_drive_id: Option<String>) -> Self {
         Self {
             http,
             token: Mutex::new(token),
@@ -97,7 +96,7 @@ impl DriveHttp {
 
     /// Construct a client for a service account.
     pub fn new_service_account(
-        http: reqwest::blocking::Client,
+        http: ureq::Agent,
         token: Token,
         sa_key: ServiceAccountKey,
         shared_drive_id: Option<String>,
@@ -131,7 +130,6 @@ impl DriveHttp {
         let mut t = self.token.lock().unwrap();
         if t.is_expired() {
             if let Some(ref key) = self.sa_key {
-                // Service account: re-sign a fresh JWT assertion.
                 let new = super::auth::obtain_service_account_token(key, &self.http)
                     .context("refresh service account token")?;
                 t.access_token = new.access_token;
@@ -146,20 +144,32 @@ impl DriveHttp {
         Ok(t.access_token.clone())
     }
 
-    fn auth_get(&self, url: &str) -> Result<reqwest::blocking::RequestBuilder> {
-        Ok(self.http.get(url).bearer_auth(self.access_token()?))
+    fn auth_get(&self, url: &str) -> Result<ureq::Request> {
+        Ok(self
+            .http
+            .get(url)
+            .set("Authorization", &format!("Bearer {}", self.access_token()?)))
     }
 
-    fn auth_post(&self, url: &str) -> Result<reqwest::blocking::RequestBuilder> {
-        Ok(self.http.post(url).bearer_auth(self.access_token()?))
+    fn auth_post(&self, url: &str) -> Result<ureq::Request> {
+        Ok(self
+            .http
+            .post(url)
+            .set("Authorization", &format!("Bearer {}", self.access_token()?)))
     }
 
-    fn auth_patch(&self, url: &str) -> Result<reqwest::blocking::RequestBuilder> {
-        Ok(self.http.patch(url).bearer_auth(self.access_token()?))
+    fn auth_patch(&self, url: &str) -> Result<ureq::Request> {
+        Ok(self
+            .http
+            .patch(url)
+            .set("Authorization", &format!("Bearer {}", self.access_token()?)))
     }
 
-    fn auth_delete(&self, url: &str) -> Result<reqwest::blocking::RequestBuilder> {
-        Ok(self.http.delete(url).bearer_auth(self.access_token()?))
+    fn auth_delete(&self, url: &str) -> Result<ureq::Request> {
+        Ok(self
+            .http
+            .delete(url)
+            .set("Authorization", &format!("Bearer {}", self.access_token()?)))
     }
 
     // -----------------------------------------------------------------------
@@ -178,14 +188,13 @@ impl DriveHttp {
             email: String,
         }
 
-        let resp = self
+        let resp = match self
             .auth_get(&format!("{API_BASE}/about"))?
-            .query(&[("fields", "user/emailAddress")])
-            .send()
-            .context("about.get")?;
-
-        if resp.status() == reqwest::StatusCode::FORBIDDEN {
-            anyhow::bail!(
+            .query("fields", "user/emailAddress")
+            .call()
+        {
+            Ok(r) => r,
+            Err(ureq::Error::Status(403, _)) => anyhow::bail!(
                 "Google Drive API returned 403 Forbidden.\n\
                  \n\
                  This usually means one of:\n\
@@ -196,14 +205,11 @@ impl DriveHttp {
                  2. Your cached token was issued before the Drive scope was granted.\n\
                     Delete it and re-authorize:\n\
                     rm ~/.config/remotefs/gdrive_token_*.json"
-            );
-        }
+            ),
+            Err(e) => return Err(anyhow!("about.get: {e}")),
+        };
 
-        let about: About = resp
-            .error_for_status()
-            .context("about.get status")?
-            .json()
-            .context("parse about.get")?;
+        let about: About = resp.into_json().context("parse about.get")?;
         Ok(about.user.email)
     }
 
@@ -225,27 +231,29 @@ impl DriveHttp {
 
         let about: About = self
             .auth_get(&format!("{API_BASE}/about"))?
-            .query(&[("fields", "storageQuota")])
-            .send()
-            .context("about.get quota")?
-            .error_for_status()
-            .context("about.get quota status")?
-            .json()
+            .query("fields", "storageQuota")
+            .call()
+            .map_err(|e| anyhow!("about.get quota: {e}"))?
+            .into_json()
             .context("parse about.get quota")?;
 
         let used: u64 = about.quota.usage.parse().unwrap_or(0);
-        let total: u64 = about.quota.limit.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let total: u64 = about
+            .quota
+            .limit
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         Ok((total, total.saturating_sub(used)))
     }
 
     pub fn get_file(&self, file_id: &str) -> Result<DriveFile> {
         self.auth_get(&format!("{API_BASE}/files/{file_id}"))?
-            .query(&[("fields", FILE_FIELDS), ("supportsAllDrives", "true")])
-            .send()
-            .context("files.get")?
-            .error_for_status()
-            .context("files.get status")?
-            .json::<DriveFile>()
+            .query("fields", FILE_FIELDS)
+            .query("supportsAllDrives", "true")
+            .call()
+            .map_err(|e| anyhow!("files.get: {e}"))?
+            .into_json()
             .context("parse files.get")
     }
 
@@ -265,26 +273,23 @@ impl DriveHttp {
         loop {
             let mut req = self
                 .auth_get(&format!("{API_BASE}/files"))?
-                .query(&[
-                    ("q", query),
-                    ("fields", fields.as_str()),
-                    ("pageSize", "1000"),
-                    ("supportsAllDrives", "true"),
-                    ("includeItemsFromAllDrives", "true"),
-                ]);
+                .query("q", query)
+                .query("fields", &fields)
+                .query("pageSize", "1000")
+                .query("supportsAllDrives", "true")
+                .query("includeItemsFromAllDrives", "true");
+
             if let Some(ref drive_id) = self.shared_drive_id {
-                req = req.query(&[("corpora", "drive"), ("driveId", drive_id.as_str())]);
+                req = req.query("corpora", "drive").query("driveId", drive_id);
             }
             if let Some(ref pt) = page_token {
-                req = req.query(&[("pageToken", pt.as_str())]);
+                req = req.query("pageToken", pt);
             }
 
             let resp: ListResp = req
-                .send()
-                .with_context(|| context.to_string())?
-                .error_for_status()
-                .with_context(|| format!("{context} status"))?
-                .json()
+                .call()
+                .map_err(|e| anyhow!("{context}: {e}"))?
+                .into_json()
                 .with_context(|| format!("parse {context}"))?;
 
             all.extend(resp.files);
@@ -303,8 +308,6 @@ impl DriveHttp {
     }
 
     /// List all trashed files visible to the authenticated account.
-    ///
-    /// For Shared Drives, results are scoped to `shared_drive_id`.
     pub fn list_trashed(&self) -> Result<Vec<DriveFile>> {
         self.list_files("trashed = true", "list trashed")
     }
@@ -314,28 +317,28 @@ impl DriveHttp {
     // -----------------------------------------------------------------------
 
     pub fn download(&self, file_id: &str) -> Result<Vec<u8>> {
-        let bytes = self
+        let response = self
             .auth_get(&format!("{API_BASE}/files/{file_id}"))?
-            .query(&[("alt", "media"), ("supportsAllDrives", "true")])
-            .send()
-            .context("files.get media")?
-            .error_for_status()
-            .context("files.get media status")?
-            .bytes()
+            .query("alt", "media")
+            .query("supportsAllDrives", "true")
+            .call()
+            .map_err(|e| anyhow!("files.get media: {e}"))?;
+        let mut bytes = Vec::new();
+        response
+            .into_reader()
+            .read_to_end(&mut bytes)
             .context("read file content")?;
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     /// Upload new content for an existing file (simple media upload).
     pub fn upload(&self, file_id: &str, content: Vec<u8>) -> Result<()> {
         self.auth_patch(&format!("{UPLOAD_BASE}/files/{file_id}"))?
-            .query(&[("uploadType", "media"), ("supportsAllDrives", "true")])
-            .header("Content-Type", "application/octet-stream")
-            .body(content)
-            .send()
-            .context("files.update media")?
-            .error_for_status()
-            .context("files.update media status")?;
+            .query("uploadType", "media")
+            .query("supportsAllDrives", "true")
+            .set("Content-Type", "application/octet-stream")
+            .send_bytes(&content)
+            .map_err(|e| anyhow!("files.update media: {e}"))?;
         Ok(())
     }
 
@@ -344,39 +347,27 @@ impl DriveHttp {
     // -----------------------------------------------------------------------
 
     pub fn create_file(&self, parent_id: &str, name: &str) -> Result<DriveFile> {
-        #[derive(serde::Serialize)]
-        struct Meta<'a> {
-            name: &'a str,
-            parents: [&'a str; 1],
-        }
-        let meta = serde_json::to_string(&Meta {
-            name,
-            parents: [parent_id],
-        })?;
+        let meta = serde_json::json!({ "name": name, "parents": [parent_id] });
+        let meta_str = serde_json::to_string(&meta)?;
 
         let boundary = "---drive_boundary_remotefs";
         let body = format!(
-            "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{meta}\r\n\
+            "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{meta_str}\r\n\
              --{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n\r\n\
              --{boundary}--"
         );
 
         self.auth_post(&format!("{UPLOAD_BASE}/files"))?
-            .query(&[
-                ("uploadType", "multipart"),
-                ("fields", FILE_FIELDS),
-                ("supportsAllDrives", "true"),
-            ])
-            .header(
+            .query("uploadType", "multipart")
+            .query("fields", FILE_FIELDS)
+            .query("supportsAllDrives", "true")
+            .set(
                 "Content-Type",
-                format!("multipart/related; boundary={boundary}"),
+                &format!("multipart/related; boundary={boundary}"),
             )
-            .body(body)
-            .send()
-            .context("files.create")?
-            .error_for_status()
-            .context("files.create status")?
-            .json::<DriveFile>()
+            .send_bytes(body.as_bytes())
+            .map_err(|e| anyhow!("files.create: {e}"))?
+            .into_json()
             .context("parse files.create")
     }
 
@@ -386,66 +377,49 @@ impl DriveHttp {
             "mimeType": FOLDER_MIME,
             "parents": [parent_id],
         });
-
         self.auth_post(&format!("{API_BASE}/files"))?
-            .query(&[("fields", FILE_FIELDS), ("supportsAllDrives", "true")])
-            .json(&body)
-            .send()
-            .context("folder create")?
-            .error_for_status()
-            .context("folder create status")?
-            .json::<DriveFile>()
+            .query("fields", FILE_FIELDS)
+            .query("supportsAllDrives", "true")
+            .send_json(&body)
+            .map_err(|e| anyhow!("folder create: {e}"))?
+            .into_json()
             .context("parse folder create")
     }
 
     /// Move a file to the trash (recoverable). Use `delete_permanent` to skip trash.
     pub fn trash_file(&self, file_id: &str) -> Result<()> {
         self.auth_patch(&format!("{API_BASE}/files/{file_id}"))?
-            .query(&[("supportsAllDrives", "true"), ("fields", "id")])
-            .json(&serde_json::json!({"trashed": true}))
-            .send()
-            .context("trash_file")?
-            .error_for_status()
-            .context("trash_file status")?;
+            .query("supportsAllDrives", "true")
+            .query("fields", "id")
+            .send_json(serde_json::json!({"trashed": true}))
+            .map_err(|e| anyhow!("trash_file: {e}"))?;
         Ok(())
     }
 
     /// Restore a trashed file, move it to `new_parent_id`, and rename it.
-    ///
-    /// Fetches the file's current parent list in order to remove them atomically
-    /// in the same `files.update` call.
     pub fn restore_file(&self, file_id: &str, new_parent_id: &str, new_name: &str) -> Result<()> {
         let file = self.get_file(file_id)?;
         let remove_parents = file.parents.unwrap_or_default().join(",");
 
-        let req = self
+        let mut req = self
             .auth_patch(&format!("{API_BASE}/files/{file_id}"))?
-            .query(&[
-                ("supportsAllDrives", "true"),
-                ("addParents", new_parent_id),
-                ("fields", "id"),
-            ]);
-        let req = if remove_parents.is_empty() {
-            req
-        } else {
-            req.query(&[("removeParents", remove_parents.as_str())])
-        };
-        req.json(&serde_json::json!({"trashed": false, "name": new_name}))
-            .send()
-            .context("restore_file")?
-            .error_for_status()
-            .context("restore_file status")?;
+            .query("supportsAllDrives", "true")
+            .query("addParents", new_parent_id)
+            .query("fields", "id");
+        if !remove_parents.is_empty() {
+            req = req.query("removeParents", &remove_parents);
+        }
+        req.send_json(serde_json::json!({"trashed": false, "name": new_name}))
+            .map_err(|e| anyhow!("restore_file: {e}"))?;
         Ok(())
     }
 
     /// Permanently delete a file, bypassing the trash.
     pub fn delete_permanent(&self, file_id: &str) -> Result<()> {
         self.auth_delete(&format!("{API_BASE}/files/{file_id}"))?
-            .query(&[("supportsAllDrives", "true")])
-            .send()
-            .context("files.delete")?
-            .error_for_status()
-            .context("files.delete status")?;
+            .query("supportsAllDrives", "true")
+            .call()
+            .map_err(|e| anyhow!("files.delete: {e}"))?;
         Ok(())
     }
 
@@ -457,23 +431,18 @@ impl DriveHttp {
         old_parent: &str,
         new_parent: &str,
     ) -> Result<()> {
-        let mut req = self
-            .auth_patch(&format!("{API_BASE}/files/{file_id}"))?
-            .query(&[
-                ("supportsAllDrives", "true"),
-                ("addParents", new_parent),
-                ("removeParents", old_parent),
-                ("fields", "id"),
-            ]);
-
-        if !new_name.is_empty() {
-            req = req.json(&serde_json::json!({ "name": new_name }));
-        }
-
-        req.send()
-            .context("files.update rename")?
-            .error_for_status()
-            .context("files.update rename status")?;
+        let body = if new_name.is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::json!({"name": new_name})
+        };
+        self.auth_patch(&format!("{API_BASE}/files/{file_id}"))?
+            .query("supportsAllDrives", "true")
+            .query("addParents", new_parent)
+            .query("removeParents", old_parent)
+            .query("fields", "id")
+            .send_json(&body)
+            .map_err(|e| anyhow!("files.update rename: {e}"))?;
         Ok(())
     }
 }

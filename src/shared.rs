@@ -73,14 +73,28 @@ impl Shared {
         let entries: HashMap<String, Option<StatData>> =
             self.attr_cache.snapshot().into_iter().collect();
         let count = entries.len();
-        write_json(&meta_path, &PersistedMetaCache { saved_at: now, entries });
-        log::info!("saved {count} attr cache entries to {}", meta_path.display());
+        write_json(
+            &meta_path,
+            &PersistedMetaCache {
+                saved_at: now,
+                entries,
+            },
+        );
+        log::info!(
+            "saved {count} attr cache entries to {}",
+            meta_path.display()
+        );
 
         let dir_path = self.disk_cache.cache_path.join("dir_cache.json");
-        let entries: HashMap<String, Vec<String>> =
-            self.dir_cache.snapshot().into_iter().collect();
+        let entries: HashMap<String, Vec<String>> = self.dir_cache.snapshot().into_iter().collect();
         let count = entries.len();
-        write_json(&dir_path, &PersistedDirCache { saved_at: now, entries });
+        write_json(
+            &dir_path,
+            &PersistedDirCache {
+                saved_at: now,
+                entries,
+            },
+        );
         log::info!("saved {count} dir cache entries to {}", dir_path.display());
     }
 

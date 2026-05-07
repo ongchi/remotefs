@@ -47,7 +47,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// remote changes within a reasonable window.
 const TTL: Duration = Duration::from_secs(10);
 
-
 // ---------------------------------------------------------------------------
 // Inode table
 // ---------------------------------------------------------------------------
@@ -676,7 +675,13 @@ impl Filesystem for RemoteFs {
                     blksize: 512,
                     flags: 0,
                 };
-                reply.created(&TTL, &attr, Generation(0), FileHandle(0), FopenFlags::empty());
+                reply.created(
+                    &TTL,
+                    &attr,
+                    Generation(0),
+                    FileHandle(0),
+                    FopenFlags::empty(),
+                );
             }
             Err(e) => {
                 log::error!("create {path}: {e}");
