@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+echo "▶ cargo fmt --check"
+cargo fmt --check
+
+echo "▶ cargo clippy"
+PKG_CONFIG=/run/current-system/sw/bin/pkg-config \
+PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
+  cargo clippy -- -D warnings
+
+echo "▶ cargo audit"
+cargo audit
