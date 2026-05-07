@@ -29,7 +29,7 @@
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use remotefs::backend::gdrive::DriveBackend;
-use remotefs::mount::{absolute_path, mount_and_run};
+use remotefs::mount::{absolute_path, daemonize_if, mount_and_run};
 use remotefs::RemoteFs;
 use remotefs::shared::Shared;
 use std::num::NonZeroUsize;
@@ -99,6 +99,10 @@ struct Args {
     #[arg(long)]
     auto_cache: bool,
 
+    /// Stay in the foreground (do not daemonize)
+    #[arg(short = 'f', long)]
+    foreground: bool,
+
     /// Verbose (info-level) logging
     #[arg(short = 'v', long)]
     verbose: bool,
@@ -151,6 +155,10 @@ fn main() -> Result<()> {
             * 4
     });
 
+    // Fork before creating thread pools so the fork happens while
+    // the process is single-threaded.
+    let ready = daemonize_if(!args.foreground)?;
+
     let task_pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(parallel)
@@ -164,7 +172,7 @@ fn main() -> Result<()> {
         fs.start_cache_updater(args.cache_timeout);
     }
 
-    mount_and_run(fs, &mount_point, "gdrive", created_mount_point)
+    mount_and_run(fs, &mount_point, "gdrive", created_mount_point, ready)
 }
 
 // ---------------------------------------------------------------------------

@@ -52,6 +52,7 @@ ssh_mount gce:/data /mnt/gce -p 2222 -i ~/.ssh/id_ed25519
 | `-t, --cache-timeout SECS` | 30                                    | Background refresh interval     |
 | `-j, --parallel N`         | 4 × CPU cores                         | Worker thread count             |
 | `--auto-cache`             | off                                   | Enable background cache refresh |
+| `-f, --foreground`         | off                                   | Stay in the foreground          |
 | `-v, --verbose`            | off                                   | Info-level logging              |
 
 Host aliases, `HostName`, `Port`, `User`, and `IdentityFile` are resolved from `~/.ssh/config` via `ssh -G` before connecting. CLI flags take precedence.
@@ -100,6 +101,7 @@ gdrive_mount sa@myproject.iam.gserviceaccount.com /mnt/drive -k ~/sa_key.json
 | `-t, --cache-timeout SECS` | 30                                           | Background refresh interval                               |
 | `-j, --parallel N`         | 4 × CPU cores                                | Worker thread count                                       |
 | `--auto-cache`             | off                                          | Enable background cache refresh                           |
+| `-f, --foreground`         | off                                          | Stay in the foreground                                    |
 | `-v, --verbose`            | off                                          | Info-level logging                                        |
 
 ### Setup: OAuth2 (desktop / personal use)
